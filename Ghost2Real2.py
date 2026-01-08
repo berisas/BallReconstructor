@@ -12,12 +12,9 @@ try:
     import threading
     GUI_AVAILABLE = True
 except ImportError:
-    print("GUI libraries not available. Running in console mode only.")
     GUI_AVAILABLE = False
 
-# ----------------------------
-# Your ML Model (from original code)
-# ----------------------------
+
 class MeshSuperResNet(tf.keras.Model):
     def __init__(self, hidden_dim=512):
         super(MeshSuperResNet, self).__init__()
@@ -83,9 +80,8 @@ class MeshSuperResNet(tf.keras.Model):
         refined_positions = query_positions + displacement
         return refined_positions
 
-# ----------------------------
-# Helper Functions (from your original code)
-# ----------------------------
+
+# Helper Functions 
 def compute_enhanced_interpolation_weights(low_vertices, high_vertices, k=8):
     """Enhanced interpolation with more neighbors and better weighting"""
     if len(low_vertices) < k:
@@ -109,6 +105,129 @@ def compute_enhanced_interpolation_weights(low_vertices, high_vertices, k=8):
 
     return weight_matrix
 
+def compute_mesh_curvature(vertices, faces):
+    """Compute mean curvature at each vertex using mesh connectivity"""
+    num_vertices = len(vertices)
+    curvatures = np.zeros(num_vertices, dtype=np.float32)
+    
+    # Build adjacency list
+    adjacency = [[] for _ in range(num_vertices)]
+    for face in faces:
+        for i in range(3):
+            v1 = face[i]
+            v2 = face[(i + 1) % 3]
+            if v2 not in adjacency[v1]:
+                adjacency[v1].append(v2)
+            if v1 not in adjacency[v2]:
+                adjacency[v2].append(v1)
+    
+    # Compute curvature as variance of normals around vertex
+    for v_idx in range(num_vertices):
+        if len(adjacency[v_idx]) < 3:
+            curvatures[v_idx] = 0.0
+            continue
+        
+        neighbors = adjacency[v_idx]
+        # Get edges from this vertex to neighbors
+        edges = vertices[neighbors] - vertices[v_idx]
+        edge_lengths = np.linalg.norm(edges, axis=1, keepdims=True)
+        edge_lengths[edge_lengths < 1e-8] = 1e-8
+        edges = edges / edge_lengths
+        
+        # Curvature as average angle deviation
+        angle_variance = 0.0
+        for i in range(len(edges)):
+            for j in range(i + 1, len(edges)):
+                dot = np.clip(np.dot(edges[i], edges[j]), -1.0, 1.0)
+                angle_variance += np.arccos(dot) ** 2
+        
+        curvatures[v_idx] = np.sqrt(angle_variance / max(len(edges), 1)) if len(edges) > 0 else 0.0
+    
+    # Normalize to [0, 1]
+    max_curv = np.max(curvatures)
+    if max_curv > 1e-8:
+        curvatures = curvatures / max_curv
+    
+    return curvatures
+
+def compute_curvature_adaptive_weights(low_vertices, high_vertices, low_faces, high_faces, k=8):
+    """Compute adaptive weights based on mesh curvature and distance"""
+    if len(low_vertices) < k:
+        k = len(low_vertices)
+    
+    # Compute curvature for both meshes
+    low_curvature = compute_mesh_curvature(low_vertices, low_faces)
+    high_curvature = compute_mesh_curvature(high_vertices, high_faces)
+    
+    tree = cKDTree(low_vertices)
+    distances, indices = tree.query(high_vertices, k=k)
+    
+    # Gaussian distance weighting
+    sigma = np.mean(distances) * 0.5
+    dist_weights = np.exp(-distances**2 / (2 * sigma**2))
+    
+    # Curvature-based adaptive weighting
+    # High curvature = more neighbors matter (increase weight spreading)
+    curvature_factor = 1.0 + high_curvature[:, np.newaxis] * 2.0  # Scale from 1.0 to 3.0
+    
+    # Combine: distance * curvature adaptation
+    weights = dist_weights * curvature_factor
+    weights = weights / np.sum(weights, axis=1, keepdims=True)
+    
+    batch_size = 1
+    num_high = len(high_vertices)
+    num_low = len(low_vertices)
+    
+    weight_matrix = np.zeros((batch_size, num_high, num_low), dtype=np.float32)
+    for i in range(num_high):
+        for j, idx in enumerate(indices[i]):
+            weight_matrix[0, i, idx] = weights[i, j]
+    
+    return weight_matrix
+
+def build_adjacency_list(faces, num_vertices):
+    """Build vertex adjacency list from faces"""
+    adjacency = [[] for _ in range(num_vertices)]
+    for face in faces:
+        for i in range(3):
+            v1 = face[i]
+            v2 = face[(i + 1) % 3]
+            if v2 not in adjacency[v1]:
+                adjacency[v1].append(v2)
+            if v1 not in adjacency[v2]:
+                adjacency[v2].append(v1)
+    return adjacency
+
+def compute_laplacian_regularization(vertices, faces):
+    """Compute Laplacian smoothing constraint for mesh smoothness"""
+    num_vertices = len(vertices)
+    adjacency = build_adjacency_list(faces, num_vertices)
+    
+    laplacian = np.zeros_like(vertices)
+    
+    for v_idx in range(num_vertices):
+        neighbors = adjacency[v_idx]
+        if len(neighbors) > 0:
+            # Laplacian = sum of neighbors - vertex position
+            neighbor_sum = np.sum(vertices[neighbors], axis=0)
+            laplacian[v_idx] = neighbor_sum / len(neighbors) - vertices[v_idx]
+    
+    return laplacian
+
+def compute_feature_aware_loss_weights(high_vertices, high_faces, curvature_threshold=0.5):
+    """Compute per-vertex loss weights based on curvature (features vs smooth)"""
+    curvatures = compute_mesh_curvature(high_vertices, high_faces)
+    
+    # Vertices with high curvature (features) get lower weight (more lenient)
+    # Vertices with low curvature (smooth) get higher weight (stricter)
+    loss_weights = np.where(
+        curvatures > curvature_threshold,
+        0.5,    # High curvature = feature region, 50% weight
+        1.0     # Low curvature = smooth region, 100% weight
+    ).astype(np.float32)
+    
+    return loss_weights, curvatures
+
 def create_enhanced_template(low_vertices, high_vertices):
     """Create better initial template with less noise"""
     template = high_vertices.copy()
@@ -117,9 +236,7 @@ def create_enhanced_template(low_vertices, high_vertices):
     template += noise
     return template.astype(np.float32)
 
-# ----------------------------
 # Main ML LOD System
-# ----------------------------
 class MLLODSystem:
     def __init__(self, mesh_path):
         self.mesh_path = mesh_path
@@ -135,8 +252,6 @@ class MLLODSystem:
 
     def _load_and_prepare_meshes(self):
         """Load original mesh and create quality variants"""
-        print("Loading and preparing mesh variants...")
-
         if not os.path.exists(self.mesh_path):
             print(f"Error: Mesh file not found: {self.mesh_path}")
             return False
@@ -148,7 +263,6 @@ class MLLODSystem:
                 print(f"Error: Invalid mesh file - no vertices found")
                 return False
 
-            print(f"Original mesh loaded: {len(self.original_mesh.vertices):,} vertices, {len(self.original_mesh.faces):,} faces")
         except Exception as e:
             print(f"Error loading mesh: {e}")
             import traceback
@@ -166,10 +280,9 @@ class MLLODSystem:
                 'high': self.original_mesh
             }
 
-            print("Mesh variants created:")
             for quality, mesh in self.mesh_variants.items():
                 reduction = ((original_faces - len(mesh.faces)) / original_faces) * 100
-                print(f"  {quality:12s}: {len(mesh.faces):,} faces ({reduction:.1f}% reduction)")
+                print(f"{quality:12s}: {len(mesh.faces):,} faces | {reduction:.1f}% reduction")
 
             return True
 
@@ -177,24 +290,28 @@ class MLLODSystem:
             print(f"Error creating mesh variants: {e}")
             return False
 
-    def train_ml_model(self, epochs=200):
+    def train_ml_model(self, epochs=100):
         """Train the ML model on actual mesh data"""
-        print("\nTraining ML Model...")
-
         try:
+            print("\n" + "="*80)
+            print("MESH LOD HIERARCHY")
+            print("="*80)
+            for quality, mesh in self.mesh_variants.items():
+                reduction = ((len(self.original_mesh.faces) - len(mesh.faces)) / len(self.original_mesh.faces)) * 100
+                print(f"  {quality:15s}: {len(mesh.vertices):6,} vertices | {len(mesh.faces):6,} faces | {reduction:5.1f}% reduction")
+            print("="*80)
+            
             # Prepare training data
-            low_vertices, high_vertices, template, weights, center, scale = self._prepare_training_data()
+            training_scales, center, scale = self._prepare_training_data()
 
             # Train model
-            model, loss_history, best_loss = self._train_model(low_vertices, high_vertices, template, weights, epochs)
+            model, loss_history, best_loss = self._train_model(training_scales, epochs)
 
             # Store results
             self.trained_model = model
             self.preprocessing_data = {
                 'center': center,
-                'scale': scale,
-                'template': template,
-                'weights': weights
+                'scale': scale
             }
 
             # Generate ML enhanced mesh
@@ -203,49 +320,91 @@ class MLLODSystem:
             # Calculate metrics
             self._calculate_quality_metrics(loss_history, best_loss)
 
-            print(f"ML Model trained successfully! Best loss: {best_loss:.6f}")
             return True
 
         except Exception as e:
             print(f"Training failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _prepare_training_data(self):
-        """Prepare training data"""
-        low_poly_mesh = self.mesh_variants['medium_base']
-        high_poly_mesh = self.mesh_variants['high']
+        """Prepare multi-scale training data for progressive refinement"""
+        # Get all resolution levels
+        ultra_low_mesh = self.mesh_variants['ultra_low']
+        low_mesh = self.mesh_variants['low']
+        medium_base_mesh = self.mesh_variants['medium_base']
+        high_mesh = self.mesh_variants['high']
 
-        high_vertices = np.array(high_poly_mesh.vertices, dtype=np.float32)
-        low_vertices = np.array(low_poly_mesh.vertices, dtype=np.float32)
+        # Extract vertices for all levels
+        ultra_low_verts = np.array(ultra_low_mesh.vertices, dtype=np.float32)
+        low_verts = np.array(low_mesh.vertices, dtype=np.float32)
+        medium_verts = np.array(medium_base_mesh.vertices, dtype=np.float32)
+        high_verts = np.array(high_mesh.vertices, dtype=np.float32)
 
-        # Normalization
-        combined_vertices = np.vstack([high_vertices, low_vertices])
-        center = np.mean(combined_vertices, axis=0)
-        scale = np.max(np.linalg.norm(combined_vertices - center, axis=1)) + 1e-8
+        # Single normalization across all levels
+        all_vertices = np.vstack([ultra_low_verts, low_verts, medium_verts, high_verts])
+        center = np.mean(all_vertices, axis=0)
+        scale = np.max(np.linalg.norm(all_vertices - center, axis=1)) + 1e-8
 
-        high_vertices_norm = (high_vertices - center) / scale
-        low_vertices_norm = (low_vertices - center) / scale
+        # Normalize all levels
+        ultra_low_norm = (ultra_low_verts - center) / scale
+        low_norm = (low_verts - center) / scale
+        medium_norm = (medium_verts - center) / scale
+        high_norm = (high_verts - center) / scale
 
-        # Create template and weights
-        template = create_enhanced_template(low_vertices_norm, high_vertices_norm)
-        weights = compute_enhanced_interpolation_weights(low_vertices_norm, high_vertices_norm)
+        # Create multi-scale training data
+        training_scales = []
+        
+        # Scale 1: ultra_low → low
+        template1 = create_enhanced_template(ultra_low_norm, low_norm)
+        weights1 = compute_curvature_adaptive_weights(ultra_low_norm, low_norm, ultra_low_mesh.faces, low_mesh.faces, k=8)
+        training_scales.append({
+            'input': ultra_low_norm[np.newaxis, :, :],
+            'target': low_norm[np.newaxis, :, :],
+            'template': template1[np.newaxis, :, :],
+            'weights': weights1,
+            'scale_name': 'ultra_low→low',
+            'scale_weight': 1.0
+        })
+        
+        # Scale 2: low → medium_base
+        template2 = create_enhanced_template(low_norm, medium_norm)
+        weights2 = compute_curvature_adaptive_weights(low_norm, medium_norm, low_mesh.faces, medium_base_mesh.faces, k=8)
+        training_scales.append({
+            'input': low_norm[np.newaxis, :, :],
+            'target': medium_norm[np.newaxis, :, :],
+            'template': template2[np.newaxis, :, :],
+            'weights': weights2,
+            'scale_name': 'low→medium',
+            'scale_weight': 1.0
+        })
+        
+        # Scale 3: medium_base → high (increased k for better context, higher weight)
+        template3 = create_enhanced_template(medium_norm, high_norm)
+        weights3 = compute_curvature_adaptive_weights(medium_norm, high_norm, medium_base_mesh.faces, high_mesh.faces, k=16)
+        
+        # Compute feature-aware loss weights and Laplacian regularization for final scale
+        loss_weights_3, curvatures_3 = compute_feature_aware_loss_weights(high_verts, high_mesh.faces, curvature_threshold=0.4)
+        laplacian_3 = compute_laplacian_regularization(high_verts, high_mesh.faces)
+        
+        training_scales.append({
+            'input': medium_norm[np.newaxis, :, :],
+            'target': high_norm[np.newaxis, :, :],
+            'template': template3[np.newaxis, :, :],
+            'weights': weights3,
+            'scale_name': 'medium→high',
+            'scale_weight': 2.0,  # Double weight for final scale
+            'loss_weights': loss_weights_3[np.newaxis, :, np.newaxis],  # [batch, vertices, 1]
+            'laplacian': (laplacian_3 / scale)[np.newaxis, :, :],  # Normalize by scale
+            'curvatures': curvatures_3
+        })
 
-        # Add batch dimension
-        low_vertices_norm = low_vertices_norm[np.newaxis, :, :]
-        high_vertices_norm = high_vertices_norm[np.newaxis, :, :]
-        template = template[np.newaxis, :, :]
+        return training_scales, center, scale
 
-        return low_vertices_norm, high_vertices_norm, template, weights, center, scale
-
-    def _train_model(self, low_vertices, high_vertices, template, weights, epochs):
-        """Train the model"""
-        low_tf = tf.constant(low_vertices, dtype=tf.float32)
-        high_tf = tf.constant(high_vertices, dtype=tf.float32)
-        template_tf = tf.constant(template, dtype=tf.float32)
-        weights_tf = tf.constant(weights, dtype=tf.float32)
-
+    def _train_model(self, training_scales, epochs):
+        """Train the model with multi-scale progressive learning"""
         model = MeshSuperResNet(hidden_dim=512)
-
         lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
             0.001, decay_steps=100, decay_rate=0.95, staircase=True
         )
@@ -253,50 +412,136 @@ class MLLODSystem:
 
         best_loss = float('inf')
         loss_history = []
+        scale_losses = {scale['scale_name']: [] for scale in training_scales}
 
-        print("Training progress:")
+        # Print training data info
+        print("\n" + "="*80)
+        print("TRAINING DATA SUMMARY")
+        print("="*80)
+        for idx, scale_data in enumerate(training_scales):
+            input_shape = scale_data['input'].shape
+            target_shape = scale_data['target'].shape
+            weights_shape = scale_data['weights'].shape
+            template_shape = scale_data['template'].shape
+            print(f"\nScale {idx}: {scale_data['scale_name']}")
+            print(f"  Input (low-res vertices):    {input_shape} → {input_shape[1]:,} vertices, {input_shape[2]} coords")
+            print(f"  Target (high-res vertices):  {target_shape} → {target_shape[1]:,} vertices, {target_shape[2]} coords")
+            print(f"  Template:                    {template_shape} → {template_shape[1]:,} vertices")
+            print(f"  Weights matrix:              {weights_shape} → sparse interpolation weights")
+            print(f"  Weight scale:                {(idx + 1) / len(training_scales):.2f}")
+        
+        print(f"\nModel parameters: {sum([tf.size(v).numpy() for v in model.trainable_variables]):,}")
+        print(f"Optimizer: Adam (LR=0.001, decay=0.95 every 100 steps)")
+        print("="*80 + "\n")
+
         for epoch in range(epochs):
-            with tf.GradientTape() as tape:
-                pred = model(low_tf, template_tf, weights_tf, training=True)
-                loss = tf.reduce_mean(tf.reduce_sum(tf.square(pred - high_tf), axis=-1))
+            total_loss = 0.0
+            
+            # Train on all scales in sequence
+            for scale_idx, scale_data in enumerate(training_scales):
+                low_tf = tf.constant(scale_data['input'], dtype=tf.float32)
+                high_tf = tf.constant(scale_data['target'], dtype=tf.float32)
+                template_tf = tf.constant(scale_data['template'], dtype=tf.float32)
+                weights_tf = tf.constant(scale_data['weights'], dtype=tf.float32)
+                
+                with tf.GradientTape() as tape:
+                    pred = model(low_tf, template_tf, weights_tf, training=True)
+                    
+                    # Compute per-vertex loss
+                    per_vertex_loss = tf.reduce_sum(tf.square(pred - high_tf), axis=-1)
+                    
+                    # Remove outliers: cap loss at 95th percentile
+                    loss_threshold = tf.constant(np.percentile(per_vertex_loss.numpy(), 95), dtype=tf.float32)
+                    clamped_loss = tf.minimum(per_vertex_loss, loss_threshold)
+                    
+                    # Apply feature-aware loss weighting (only for final scale)
+                    if 'loss_weights' in scale_data:
+                        loss_weights_tf = tf.constant(scale_data['loss_weights'], dtype=tf.float32)
+                        weighted_loss = clamped_loss[np.newaxis, :] * loss_weights_tf
+                        base_loss = tf.reduce_mean(weighted_loss)
+                        
+                        # Add Laplacian smoothing regularization (keeps smooth regions smooth)
+                        laplacian_tf = tf.constant(scale_data['laplacian'], dtype=tf.float32)
+                        laplacian_term = tf.reduce_mean(tf.square(pred - laplacian_tf))
+                        
+                        # Combine: prediction accuracy + smoothness constraint (reduced weight)
+                        regularization_weight = 0.01  # Reduced from 0.1
+                        combined_loss = base_loss + regularization_weight * laplacian_term
+                    else:
+                        combined_loss = tf.reduce_mean(clamped_loss)
+                    
+                    # Apply scale weight
+                    scale_weight = scale_data.get('scale_weight', (scale_idx + 1) / len(training_scales))
+                    loss = scale_weight * combined_loss
 
-            grads = tape.gradient(loss, model.trainable_variables)
-            grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in grads]
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                grads = tape.gradient(loss, model.trainable_variables)
+                grad_norms = [tf.norm(g).numpy() if g is not None else 0.0 for g in grads]
+                grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in grads]
+                optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                
+                scale_loss = loss.numpy()
+                scale_losses[scale_data['scale_name']].append(scale_loss)
+                total_loss += scale_loss
 
-            current_loss = loss.numpy()
-            loss_history.append(current_loss)
+            avg_loss = total_loss / len(training_scales)
+            loss_history.append(avg_loss)
 
-            if current_loss < best_loss:
-                best_loss = current_loss
+            if avg_loss < best_loss:
+                best_loss = avg_loss
 
-            if (epoch + 1) % 50 == 0:
-                print(f"  Epoch {epoch+1:3d}/{epochs} | Loss: {current_loss:.6f} | Best: {best_loss:.6f}")
+            if (epoch + 1) % 25 == 0:
+                # Calculate improvement rate
+                if len(loss_history) > 25:
+                    prev_loss = loss_history[-26]
+                    improvement = ((prev_loss - avg_loss) / prev_loss) * 100
+                else:
+                    improvement = 0
+                
+                loss_breakdown = " | ".join([f"{name}: {scale_losses[name][-1]:.6f}" for name in scale_losses.keys()])
+                current_lr = float(optimizer.learning_rate.numpy())
+                print(f"Epoch {epoch+1:3d}/{epochs} | Loss: {avg_loss:.6f} | Best: {best_loss:.6f} | Improvement: {improvement:+.2f}% | LR: {current_lr:.6f}")
+                print(f"  → {loss_breakdown}")
 
         return model, loss_history, best_loss
 
     def _generate_ml_enhanced_mesh(self):
-        """Generate ML enhanced mesh"""
+        """Generate ML enhanced mesh by progressively refining through all scales"""
         if self.trained_model is None:
             return None
 
         try:
             prep_data = self.preprocessing_data
+            center = prep_data['center']
+            scale = prep_data['scale']
 
-            # Prepare input
-            low_vertices_norm = (self.mesh_variants['medium_base'].vertices - prep_data['center']) / prep_data['scale']
-            low_vertices_norm = low_vertices_norm[np.newaxis, :, :]
+            # Start with medium_base and progressively refine upward
+            current_vertices = (self.mesh_variants['medium_base'].vertices - center) / scale
+            current_vertices = current_vertices[np.newaxis, :, :]
 
-            # Generate enhanced vertices
+            # Progressive refinement: medium_base → high
+            medium_norm = current_vertices
+            high_verts_norm = (self.mesh_variants['high'].vertices - center) / scale
+            high_verts_norm = high_verts_norm[np.newaxis, :, :]
+            
+            template = create_enhanced_template(
+                medium_norm[0], high_verts_norm[0]
+            )
+            weights = compute_enhanced_interpolation_weights(
+                medium_norm[0], high_verts_norm[0]
+            )
+            
+            template = template[np.newaxis, :, :]
+            
+            # Generate enhanced vertices at highest resolution
             enhanced_vertices_norm = self.trained_model(
-                tf.constant(low_vertices_norm, dtype=tf.float32),
-                tf.constant(prep_data['template'], dtype=tf.float32),
-                tf.constant(prep_data['weights'], dtype=tf.float32),
+                tf.constant(medium_norm, dtype=tf.float32),
+                tf.constant(template, dtype=tf.float32),
+                tf.constant(weights, dtype=tf.float32),
                 training=False
             )
 
             # Denormalize
-            enhanced_vertices = enhanced_vertices_norm.numpy()[0] * prep_data['scale'] + prep_data['center']
+            enhanced_vertices = enhanced_vertices_norm.numpy()[0] * scale + center
 
             # Create mesh
             ml_enhanced_mesh = trimesh.Trimesh(
@@ -308,6 +553,8 @@ class MLLODSystem:
 
         except Exception as e:
             print(f"Error generating ML enhanced mesh: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _calculate_quality_metrics(self, loss_history, best_loss):
@@ -341,12 +588,9 @@ class MLLODSystem:
         # Positions and colors
         positions = [np.array([0, 0, 0]), np.array([4, 0, 0]), np.array([8, 0, 0]), np.array([12, 0, 0]), np.array([16, 0, 0])]
         colors = [[255, 100, 100, 255], [255, 200, 100, 255], [255, 255, 100, 255], [100, 255, 100, 255], [100, 100, 255, 255]]
-        labels = ["Ultra Low", "Low", "Medium Base", "🤖 ML Enhanced", "Original"]
+        labels = ["Ultra Low", "Low", "Medium Base", "ML Enhanced", "Original"]
         meshes = [self.mesh_variants['ultra_low'], self.mesh_variants['low'],
                  self.mesh_variants['medium_base'], self.ml_enhanced_mesh, self.mesh_variants['high']]
-
-        print("\nVISUAL RESULTS")
-        print("=" * 60)
 
         for i, (mesh, pos, color, label) in enumerate(zip(meshes, positions, colors, labels)):
             positioned_mesh = mesh.copy()
@@ -355,26 +599,19 @@ class MLLODSystem:
             scene.add_geometry(positioned_mesh)
 
             faces = len(mesh.faces)
-            print(f"{i+1}. {label:15s}: {faces:,} faces")
+            print(f"{label:15s}: {faces:,} faces")
 
-        print(f"\nKEY:")
-        print(f"RED: Ultra low  ORANGE: Low  YELLOW: Medium")
-        print(f"GREEN: ML Enhanced (YOUR MODEL!)  BLUE: Original")
-        print(f"\n Compare GREEN to BLUE - they should look very similar!")
-
-        # Show metrics
-        print(f"\nQUALITY METRICS:")
+        print()
         for metric, value in self.quality_metrics.items():
             if isinstance(value, float):
-                print(f"  {metric:25s}: {value:.6f}")
+                print(f"{metric}: {value:.6f}")
             else:
-                print(f"  {metric:25s}: {value}")
+                print(f"{metric}: {value}")
 
         scene.show()
 
-# ----------------------------
-# Simple Console Interface
-# ----------------------------
+
+# Console Interface
 def run_console_demo(file_path=None):
     """Run console-based demo"""
     if file_path is None:
@@ -382,13 +619,8 @@ def run_console_demo(file_path=None):
 
     if not os.path.exists(file_path):
         print(f"Error: File not found: {file_path}")
-        print("Please update the file_path variable with your mesh location.")
         return
 
-    print("ML LOD SYSTEM - CONSOLE MODE")
-    print("=" * 50)
-
-    # Initialize system
     lod_system = MLLODSystem(file_path)
 
     if not lod_system.mesh_variants:
@@ -405,13 +637,8 @@ def run_console_demo(file_path=None):
     # Show results
     lod_system.show_visual_results()
 
-    print(f"\n SUCCESS!")
-    print(f"Your ML model enhanced mesh quality from {len(lod_system.mesh_variants['medium_base'].faces):,} to {len(lod_system.original_mesh.faces):,} faces!")
-    print(f"Reconstruction error: {lod_system.quality_metrics['reconstruction_error_mean']:.6f}")
 
-# ----------------------------
-# GUI Interface (if available)
-# ----------------------------
+# GUI Interface 
 if GUI_AVAILABLE:
     class ResearchGUI:
         def __init__(self, file_path=None):
@@ -475,7 +702,7 @@ LOD Variants Generated:
             preview_btn = tk.Button(left_panel, text="Preview Mesh",
                                    command=self.preview_mesh,
                                    font=("Arial", 10), bg="#3498db", fg="white",
-                                   activebackground="#2980b9", cursor="hand2")
+                                   activebackground="#2980b9", cursor="hand2", height=2, width=20)
             preview_btn.pack(pady=10, fill="x")
 
             # Right panel - Training Configuration
@@ -522,16 +749,16 @@ Training Strategy:
             train_btn = tk.Button(right_panel, text="Start Training",
                                  command=self.train_model,
                                  font=("Arial", 12, "bold"), bg="#27ae60", fg="white",
-                                 activebackground="#229954", cursor="hand2", height=2)
+                                 activebackground="#229954", cursor="hand2", height=2, width=25)
             train_btn.pack(pady=10, fill="x")
 
-            # Results button
-            self.results_btn = tk.Button(right_panel, text="View Results & Metrics",
-                                        command=self.show_results,
-                                        font=("Arial", 11), bg="#e74c3c", fg="white",
-                                        activebackground="#c0392b", cursor="hand2",
-                                        state="disabled")
-            self.results_btn.pack(pady=5, fill="x")
+            # View ML Enhanced Mesh button
+            self.ml_mesh_btn = tk.Button(right_panel, text="View ML Enhanced Mesh",
+                                        command=self.show_ml_enhanced_mesh,
+                                        font=("Arial", 11), bg="#9b59b6", fg="white",
+                                        activebackground="#8e44ad", cursor="hand2",
+                                        state="disabled", height=2, width=25)
+            self.ml_mesh_btn.pack(pady=5, fill="x")
 
             # Bottom panel - Training Progress & Metrics
             bottom_panel = tk.LabelFrame(main_frame, text="Training Progress & Metrics",
@@ -550,7 +777,7 @@ Training Strategy:
             progress_bar.pack(side="left", fill="x", expand=True, padx=5)
 
             # Status label
-            self.status_label = tk.Label(bottom_panel, text="Ready to begin training",
+            self.status_label = tk.Label(bottom_panel, text="Ready",
                                         font=("Arial", 10), bg="white", fg="#7f8c8d")
             self.status_label.pack(pady=5)
 
@@ -572,15 +799,81 @@ Training Strategy:
             return self.root
 
         def preview_mesh(self):
-            """Show preview of the original mesh"""
-            self.lod_system.original_mesh.show()
+            """Show multi-scale refinement pipeline with before/after comparisons"""
+            scene = trimesh.Scene()
+            
+            # Calculate bounding box size for proper spacing
+            ref_mesh = self.lod_system.mesh_variants['high']
+            bbox_size = np.max(ref_mesh.bounds[1] - ref_mesh.bounds[0])
+            spacing = bbox_size * 1.5  # 1.5x spacing between meshes
+            row_spacing = bbox_size * 2  # 2x spacing between rows
+            
+            if self.lod_system.ml_enhanced_mesh is None:
+                # Before training: 2x2 grid showing all LOD levels
+                print("\n=== BEFORE TRAINING - LOD HIERARCHY ===\n")
+                
+                grid_layout = [
+                    # Row 0 (top)
+                    (self.lod_system.mesh_variants['ultra_low'], [0, row_spacing, 0], [255, 100, 100, 255], "Ultra Low (1/20)"),
+                    (self.lod_system.mesh_variants['low'], [spacing, row_spacing, 0], [255, 180, 100, 255], "Low (1/8)"),
+                    # Row 1 (bottom)
+                    (self.lod_system.mesh_variants['medium_base'], [0, 0, 0], [255, 255, 100, 255], "Medium Base (1/4)"),
+                    (self.lod_system.mesh_variants['high'], [spacing, 0, 0], [100, 150, 255, 255], "Original (100%)")
+                ]
+                
+                for mesh, pos, color, label in grid_layout:
+                    positioned_mesh = mesh.copy()
+                    positioned_mesh.vertices += np.array(pos)
+                    positioned_mesh.visual.vertex_colors = color
+                    scene.add_geometry(positioned_mesh)
+                    print(f"{label:25s}: {len(mesh.vertices):,} vertices, {len(mesh.faces):,} faces")
+                    
+            else:
+                # After training: 2 rows of before/after comparisons
+                print("\n=== AFTER TRAINING - REFINEMENT RESULTS ===\n")
+                
+                # Row positions (top to bottom)
+                row_positions = [row_spacing, 0]
+                
+                # Row 0: Medium Base untrained vs Original
+                medium_untrained = self.lod_system.mesh_variants['medium_base'].copy()
+                medium_untrained.vertices += np.array([0, row_positions[0], 0])
+                medium_untrained.visual.vertex_colors = [255, 255, 100, 255]
+                scene.add_geometry(medium_untrained)
+                
+                original = self.lod_system.mesh_variants['high'].copy()
+                original.vertices += np.array([spacing, row_positions[0], 0])
+                original.visual.vertex_colors = [100, 150, 255, 255]
+                scene.add_geometry(original)
+                print(f"Row 0 - Coarse:")
+                print(f"  Medium Base (untrained)   : {len(medium_untrained.vertices):,} vertices, {len(medium_untrained.faces):,} faces")
+                print(f"  Original (reference)      : {len(original.vertices):,} vertices, {len(original.faces):,} faces")
+                
+                # Row 1: Medium Base trained vs ML Enhanced
+                medium_trained = self.lod_system.mesh_variants['medium_base'].copy()
+                medium_trained.vertices += np.array([0, row_positions[1], 0])
+                medium_trained.visual.vertex_colors = [200, 255, 100, 255]
+                scene.add_geometry(medium_trained)
+                
+                ml_enhanced = self.lod_system.ml_enhanced_mesh.copy()
+                ml_enhanced.vertices += np.array([spacing, row_positions[1], 0])
+                ml_enhanced.visual.vertex_colors = [100, 255, 200, 255]
+                scene.add_geometry(ml_enhanced)
+                print(f"\nRow 1 - Medium:")
+                print(f"  Medium Base (trained)     : {len(medium_trained.vertices):,} vertices, {len(medium_trained.faces):,} faces")
+                print(f"  ML Enhanced (output)      : {len(ml_enhanced.vertices):,} vertices, {len(ml_enhanced.faces):,} faces")
+                
+                print("\n[Left side = baseline/untrained | Right side = final output]")
+            
+            print()
+            scene.show()
 
         def train_model(self):
             epochs = self.epochs_var.get()
-            self.status_label.config(text=f"Training with {epochs} epochs... Please wait", fg="#e67e22")
+            self.status_label.config(text=f"Training {epochs} epochs", fg="#e67e22")
             self.progress_var.set(0)
             self.results_text.delete(1.0, tk.END)
-            self.results_text.insert(1.0, f"[TRAINING STARTED]\nEpochs: {epochs}\nModel: MeshSuperResNet (512-dim)\n\n")
+            self.results_text.insert(1.0, f"Epochs: {epochs}\n\n")
             self.root.update()
 
             def train_worker():
@@ -596,50 +889,57 @@ Training Strategy:
             thread.start()
 
         def _training_success(self):
-            self.status_label.config(text="✓ Training completed successfully!", fg="#27ae60")
+            self.status_label.config(text="Training complete", fg="#27ae60")
             self.progress_var.set(100)
-            self.results_btn.config(state="normal")
+            self.ml_mesh_btn.config(state="normal")
 
             metrics = self.lod_system.quality_metrics
 
-            results = f"""[TRAINING COMPLETED]
+            results = f"""PERFORMANCE METRICS
 
-==================== PERFORMANCE METRICS ====================
+Reconstruction:
+  Mean Error: {metrics['reconstruction_error_mean']:.8f}
+  Max Error: {metrics['reconstruction_error_max']:.8f}
+  Final Loss: {metrics['final_training_loss']:.8f}
+  Best Loss: {metrics['best_training_loss']:.8f}
 
-Reconstruction Quality:
-  • Mean Error:         {metrics['reconstruction_error_mean']:.8f}
-  • Max Error:          {metrics['reconstruction_error_max']:.8f}
-  • Final Loss:         {metrics['final_training_loss']:.8f}
-  • Best Loss:          {metrics['best_training_loss']:.8f}
+Mesh:
+  Face Count: {metrics['face_improvement']}
+  Quality Gain: {metrics['quality_improvement']:.2f}%
 
-Mesh Enhancement:
-  • Face Count:         {metrics['face_improvement']}
-  • Quality Gain:       {metrics['quality_improvement']:.2f}%
-
-Training Configuration:
-  • Epochs:             {self.epochs_var.get()}
-  • Hidden Dimension:   512
-  • Learning Rate:      0.001 (exponential decay)
-  • Gradient Clipping:  L2 norm ≤ 1.0
-
-==============================================================
-
-✓ Model successfully learned to enhance mesh geometry.
-✓ Ready for visual inspection and further analysis.
-
-Click 'View Results & Metrics' to see 3D comparison.
+Configuration:
+  Epochs: {self.epochs_var.get()}
+  Hidden Dim: 512
+  LR: 0.001 (exponential decay)
+  Gradient Clip: L2 ≤ 1.0
 """
 
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(1.0, results)
 
         def _training_failed(self):
-            self.status_label.config(text="✗ Training failed - check console", fg="#e74c3c")
+            self.status_label.config(text="Training failed", fg="#e74c3c")
             self.results_text.delete(1.0, tk.END)
-            self.results_text.insert(1.0, "[TRAINING FAILED]\n\nCheck console output for error details.\nCommon issues:\n  • Invalid mesh file\n  • Insufficient memory\n  • Incompatible TensorFlow version")
+            self.results_text.insert(1.0, "TRAINING FAILED\n\nCheck console for details.")
 
         def show_results(self):
             self.lod_system.show_visual_results()
+
+        def show_ml_enhanced_mesh(self):
+            """Show only the ML-enhanced mesh with added vertices"""
+            if self.lod_system.ml_enhanced_mesh is None:
+                print("ML enhanced mesh not available!")
+                return
+
+            scene = trimesh.Scene()
+            
+            # Add the ML enhanced mesh
+            ml_mesh = self.lod_system.ml_enhanced_mesh.copy()
+            ml_mesh.visual.vertex_colors = [100, 200, 255, 255]  # Light blue
+            scene.add_geometry(ml_mesh)
+            
+            print(f"ML Enhanced Mesh: {len(ml_mesh.vertices):,} vertices, {len(ml_mesh.faces):,} faces")
+            scene.show()
 
     def run_gui_demo(file_path=None):
         """Run GUI demo"""
@@ -653,14 +953,9 @@ Click 'View Results & Metrics' to see 3D comparison.
 # ----------------------------
 def main():
     """Main function - chooses GUI or console mode"""
-    print("ML MESH ENHANCEMENT SYSTEM")
-    print("=" * 40)
-
     if GUI_AVAILABLE:
-        print("Starting GUI mode...")
         run_gui_demo()
     else:
-        print("GUI not available, running console mode...")
         run_console_demo()
 
 if __name__ == "__main__":
