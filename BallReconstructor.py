@@ -3,10 +3,8 @@ import numpy as np
 import trimesh
 from scipy.spatial import cKDTree
 import os
-import time
 import matplotlib.pyplot as plt
 try:
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     import tkinter as tk
     from tkinter import ttk
     import threading
@@ -475,7 +473,6 @@ class MLLODSystem:
                     loss = scale_weight * combined_loss
 
                 grads = tape.gradient(loss, model.trainable_variables)
-                grad_norms = [tf.norm(g).numpy() if g is not None else 0.0 for g in grads]
                 grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in grads]
                 optimizer.apply_gradients(zip(grads, model.trainable_variables))
                 
@@ -514,12 +511,9 @@ class MLLODSystem:
             center = prep_data['center']
             scale = prep_data['scale']
 
-            # Start with medium_base and progressively refine upward
-            current_vertices = (self.mesh_variants['medium_base'].vertices - center) / scale
-            current_vertices = current_vertices[np.newaxis, :, :]
-
-            # Progressive refinement: medium_base → high
-            medium_norm = current_vertices
+            # Normalize vertices
+            medium_norm = (self.mesh_variants['medium_base'].vertices - center) / scale
+            medium_norm = medium_norm[np.newaxis, :, :]
             high_verts_norm = (self.mesh_variants['high'].vertices - center) / scale
             high_verts_norm = high_verts_norm[np.newaxis, :, :]
             
@@ -647,7 +641,6 @@ if GUI_AVAILABLE:
             self.file_path = file_path if file_path else r"C:\Users\Ber\BallReconstructor\tennis_ball.obj"
             self.epochs_var = None
             self.progress_var = None
-            self.training_data = []
 
         def create_gui(self):
             if not os.path.exists(self.file_path):
@@ -921,9 +914,6 @@ Configuration:
             self.status_label.config(text="Training failed", fg="#e74c3c")
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(1.0, "TRAINING FAILED\n\nCheck console for details.")
-
-        def show_results(self):
-            self.lod_system.show_visual_results()
 
         def show_ml_enhanced_mesh(self):
             """Show only the ML-enhanced mesh with added vertices"""
