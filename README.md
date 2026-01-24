@@ -11,20 +11,22 @@ A deep learning system that enhances low-poly 3D meshes to high-poly quality usi
 
 ## Features
 
-- **Neural Mesh Enhancement**: Train a custom deep learning model to upscale mesh resolution
-- **Multi-Level LOD System**: Automatic generation of multiple quality levels for comparison
-- **Dual Interface**: Both GUI and console modes supported
-- **Visual Comparison**: Side-by-side visualization of all quality levels
-- **Advanced Architecture**: Encoder-decoder network with local/global feature learning
-- **Quality Metrics**: Detailed reconstruction error analysis and training statistics
-- **Unity Integration**: Works alongside Unity project for game development workflow
+- **Multi-Scale Progressive Training**: Cascading refinement through 3 resolution levels
+- **Curvature-Adaptive Learning**: Intelligent weighting of features vs smooth regions
+- **Learnable Scaling Parameters**: Automatic adaptation of feature and displacement scales
+- **Research GUI Interface**: Interactive training with configurable epochs and real-time feedback
+- **Laplacian Regularization**: Prevents over-fitting on smooth surfaces
+- **Advanced LOD System**: Automatic multi-level mesh hierarchy generation
+- **Comprehensive Metrics**: Detailed reconstruction error analysis and training statistics
+- **Gradient Clipping**: Stable training across mesh complexity variations
+- **Flexible Input**: Works with any OBJ format mesh
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/berisas/GhostObjects.git
-cd GhostObjects
+git clone https://github.com/berisas/BallReconstructor.git
+cd BallReconstructor
 ```
 
 2. Install Python dependencies:
@@ -37,27 +39,32 @@ pip install -r requirements.txt
 ### Quick Start (Console Mode)
 
 ```bash
-python Ghost2Real2.py
+python BallReconstructor.py
 ```
 
 The application will:
-1. Load the tennis ball mesh
-2. Create multiple LOD variants
-3. Train the ML model (150 epochs)
-4. Display visual results with quality metrics
+1. Load the tennis ball mesh (or custom mesh if specified)
+2. Generate multi-scale LOD variants automatically
+3. Train the ML model progressively (3 scales, 150 epochs default)
+4. Display side-by-side comparison of refinement results
+5. Output comprehensive quality metrics
 
-### GUI Mode
+### GUI Mode (Recommended for Research)
 
-If tkinter is available, the application automatically launches a GUI:
+If tkinter is available, the application launches a research-focused interface:
 
-1. Click "Train ML Model" to start training
-2. Wait for training to complete (progress shown in console)
-3. Click "Show Results" to visualize the comparison
+1. **Mesh Information Panel**: View LOD hierarchy and mesh statistics
+2. **Training Configuration**: Adjust epochs (50-1000) before training
+3. **Training Progress**: Monitor real-time progress and metrics
+4. **Results Visualization**: 
+   - "View ML Enhanced Mesh" to inspect the network output
+   - "Preview Mesh" to see the LOD hierarchy
+5. **Quality Metrics**: Mean error, max error, and quality improvement displayed
 
 ### Custom Mesh
 
 ```python
-from Ghost2Real2 import MLLODSystem
+from BallReconstructor import MLLODSystem
 
 # Load your own mesh
 lod_system = MLLODSystem("path/to/your/mesh.obj")
@@ -71,34 +78,82 @@ lod_system.show_visual_results()
 
 ## How It Works
 
-### 1. Data Preparation
-- Loads original high-poly mesh (target)
-- Creates simplified low-poly mesh (30% face reduction)
-- Normalizes geometry and computes interpolation weights
+### 1. Multi-Scale Progressive Refinement
+The system trains through **three cascading scales**, progressively refining from coarse to fine:
 
-### 2. Neural Network Training
+- **Scale 1**: Ultra-Low (5%) → Low (12.5%)
+- **Scale 2**: Low (12.5%) → Medium (25%)  
+- **Scale 3**: Medium (25%) → High (100%) - Primary training with 2x weight
+
+### 2. Intelligent Feature Learning
 - **Local Encoder**: Extracts geometric features from low-poly vertices
-- **Global Encoder**: Captures overall mesh shape statistics
-- **Position Decoder**: Predicts high-quality vertex positions
+- **Global Encoder**: Captures mesh-wide shape context (max/mean/std statistics)
+- **Position Decoder**: Predicts per-vertex displacement refinements using both local and global information
 
-### 3. Multi-Phase Training
-- Position learning phase (high regularization)
-- Refinement phase (medium regularization)
-- Fine-tuning phase (low regularization)
+### 3. Advanced Training Techniques
+- **Curvature-Adaptive Loss Weighting**: High-curvature features (details) penalized less than smooth regions
+- **Laplacian Regularization**: Prevents over-smoothing while preserving geometric detail
+- **Feature-Aware Loss**: Differentiates between feature and smooth surface regions
+- **Gradient Clipping**: Ensures stable training across varied mesh complexities
+- **Progressive Scale Weighting**: Final highest-resolution scale emphasized during training
 
 ### 4. Visualization
-Displays 5 meshes side-by-side:
-- **Red**: Ultra Low (5% faces)
-- **Orange**: Low (12.5% faces)
-- **Yellow**: Medium Base (25% faces) - ML input
-- **Green**: ML Enhanced (100% faces) - Your model's output!
-- **Blue**: Original (100% faces) - Ground truth
+Displays mesh comparison side-by-side (before/after training):
+- **Before Training**: LOD hierarchy showing progressive detail reduction
+- **After Training**: Before/after refinement comparisons at each scale
+
+## Model Architecture
+
+**MeshSuperResNet** uses a sophisticated encoder-decoder design:
+
+```
+Low-Res Vertices (input)
+         ↓
+    [Local Encoder]
+    Dense(512) → LayerNorm → Dropout
+    Dense(512) → LayerNorm → Dropout
+    Dense(512) → LayerNorm
+         ↓ (scaled by learnable feature_scale)
+    [Global Context]
+    max/mean/std → [Global Encoder]
+    Dense(512) → LayerNorm
+    Dense(256)
+         ↓
+    [Feature Interpolation]
+    K-NN weights applied to local features
+         ↓
+    [Position Decoder]
+    Concatenate [position, interpolated_features, global_context]
+    Dense(1024) → LayerNorm → Dropout
+    Dense(512) → LayerNorm → Dropout
+    Dense(512) → LayerNorm → Dropout
+    Dense(256)
+    Dense(3) + Tanh
+         ↓ (scaled by learnable displacement_scale)
+    Predicted vertex displacement
+         ↓
+    High-Res Vertices (output)
+```
+
+**Training Hyperparameters:**
+- Optimizer: Adam (LR=0.001, exponential decay 0.95 every 100 steps)
+- Loss: Feature-weighted MSE + Laplacian smoothness (0.01)
+- Gradient clipping: L2 norm ≤ 1.0
+- K-NN neighbors: 8 (normal scales), 16 (final scale)
+- Batch size: 1 (full mesh)
 
 ## Project Structure
 
 ```
-GhostObjects/
-├── Ghost2Real2.py         # ML mesh super-resolution system
+BallReconstructor/
+├── BallReconstructor.py        # Main application (LOD system + ML pipeline)
+├── requirements.txt            # Python dependencies
+├── README.md                   # This file
+├── CLAUDE.md                   # AI assistant guidance
+├── LICENSE                     # MIT license
+└── tennis_ball.obj             # Sample mesh for testing
+```
+├── BallReconstructor.py  # ML mesh super-resolution system
 ├── tennis_ball.obj        # Test mesh
 ├── requirements.txt       # Python dependencies
 ├── CLAUDE.md             # Detailed technical documentation

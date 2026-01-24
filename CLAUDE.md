@@ -4,34 +4,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Ghost2Real** is a neural mesh super-resolution system that uses deep learning to enhance low-poly 3D meshes to high-poly quality. The project implements a custom TensorFlow neural network trained to learn geometric details and reconstruct high-resolution mesh vertices from simplified inputs.
+**Ghost2Real** is a neural mesh super-resolution system that uses deep learning to enhance low-poly 3D meshes to high-poly quality. The project implements a custom TensorFlow neural network trained to learn geometric details and reconstruct high-resolution mesh vertices through multi-scale progressive refinement.
 
 This project is part of the **GhostObjects** repository, which combines Unity 3D development with machine learning for mesh enhancement.
 
 **Core Component**:
-- `Ghost2Real2.py` - Production version with LOD system, GUI interface, and complete ML pipeline
+- `Ghost2Real2.py` - Production version with multi-scale LOD system, research-focused GUI interface, and complete ML pipeline
 
 ## Running the Application
 
+### GUI Mode (preferred if tkinter available)
+```bash
+python BallReconstructor.py
+```
+Launches research-focused interface with configurable training parameters and visual comparisons.
+
 ### Console Mode
 ```bash
-python Ghost2Real2.py
+python BallReconstructor.py
 ```
+Falls back to console mode if tkinter unavailable. Runs 150 epochs on default mesh and displays results.
 
-### GUI Mode (if tkinter available)
-```bash
-python Ghost2Real2.py
-```
-The application will automatically detect if GUI libraries are available and launch the appropriate interface.
-
-### Command Line with Custom Mesh
+### Programmatic Usage
 ```python
-from Ghost2Real2 import MLLODSystem
+from BallReconstructor import MLLODSystem
 
 # Initialize with custom mesh file
 lod_system = MLLODSystem("path/to/your/mesh.obj")
 
-# Train the model
+# Train the model (customizable epochs)
 lod_system.train_ml_model(epochs=200)
 
 # Visualize results
@@ -42,62 +43,108 @@ lod_system.show_visual_results()
 
 ### Neural Network Model (`MeshSuperResNet`)
 
-The model uses a sophisticated encoder-decoder architecture:
+Advanced encoder-decoder with learnable scaling parameters:
 
 1. **Local Encoder** (512-dim hidden)
-   - 3-layer dense network with LayerNorm and Dropout
-   - Extracts local geometric features from low-poly vertices
-   - Scaled by learnable `feature_scale` parameter
+   - 3-layer dense network with LayerNormalization and Dropout (0.1)
+   - Extracts local geometric features from low-resolution vertices
+   - Output scaled by learnable `feature_scale` parameter (trainable)
 
 2. **Global Encoder** (256-dim output)
-   - Processes max, mean, and std statistics
-   - Captures overall mesh shape and structure
-   - Provides context for local refinement
+   - Processes global statistics: max, mean, and std of local features
+   - Captures overall mesh shape context
+   - Provides global refinement guidance
 
 3. **Position Decoder** (5-layer network)
-   - Combines local features + global context + query positions
-   - Predicts displacement vectors for vertex refinement
-   - Outputs 3D positions with tanh activation and learnable scaling
+   - Combines: interpolated local features + global context + query positions
+   - 512→512→512→256 dense layers with LayerNorm and Dropout
+   - Final output: 3D displacement vectors (tanh activation)
+   - Displacement scaled by learnable `displacement_scale` parameter (trainable)
 
-### Training Pipeline
+### Multi-Scale Training Pipeline
 
-1. **Data Preparation**
-   - Loads original high-poly mesh (target)
-   - Creates simplified low-poly mesh (30% reduction by default)
-   - Normalizes vertices around centroid with uniform scale
-   - Computes k-NN interpolation weights (k=8 neighbors, Gaussian weighting)
+The system uses **progressive multi-scale refinement** through 3 cascading scales:
 
-2. **Template Generation**
-   - Creates initial guess with minimal noise (2% of std)
-   - Used as starting point for vertex prediction
+#### Scale 1: Ultra-Low → Low
+- Input: ~5% face count
+- Output: ~12.5% face count
+- Purpose: Learn coarse geometric structure
 
-3. **Training Loop**
-   - MSE loss between predicted and target vertices
-   - Adam optimizer with exponential learning rate decay
-   - Gradient clipping (max norm 1.0) for stability
-   - Early stopping available via patience parameter
+#### Scale 2: Low → Medium
+- Input: ~12.5% face count
+- Output: ~25% face count
+- Purpose: Refine intermediate details
 
-4. **LOD System** (`MLLODSystem`)
-   - Creates multiple mesh quality levels:
-     - Ultra Low: ~5% of original faces
-     - Low: ~12.5% of original faces
-     - Medium Base: ~25% of original faces (ML training input)
-     - ML Enhanced: Full face count with ML-predicted vertices
-     - High: Original mesh (target quality)
+#### Scale 3: Medium → High (weighted 2x)
+- Input: ~25% face count (Medium Base, training input)
+- Output: 100% face count (Original, training target)
+- **Special features:**
+  - k-NN increased to 16 neighbors for better context
+  - Feature-aware loss weighting (curvature-based)
+  - Laplacian smoothness regularization (0.01 weight)
+  - Per-vertex outlier clamping at 95th percentile loss
+
+**Training Details:**
+- Optimizer: Adam with exponential learning rate decay (LR=0.001, decay=0.95 every 100 steps)
+- Loss: Feature-weighted MSE + smoothness regularization (final scale only)
+- Gradient clipping: L2 norm ≤ 1.0 per step
+- All scales normalized to single coordinate space
+- Template generation: 2% Gaussian noise initialization
+
+### Helper Functions & Algorithms
+
+1. **compute_curvature_adaptive_weights()**
+   - Mesh curvature computed from edge angle variance
+   - High-curvature regions (features) get 50% loss weight
+   - Low-curvature regions (smooth) get 100% loss weight
+   - Distance-based weighting scaled by local curvature
+
+2. **compute_mesh_curvature()**
+   - Per-vertex curvature from local edge angle statistics
+   - Used for adaptive loss weighting and visualization
+
+3. **compute_laplacian_regularization()**
+   - Graph-based smoothness constraint
+   - Prevents over-fitting in smooth surface regions
+   - Applied only to final highest-resolution training scale
+
+### LOD System (`MLLODSystem`)
+
+Automatic mesh hierarchy generation:
+
+| Level | Reduction | Purpose |
+|-------|-----------|---------|
+| Ultra Low | 95% faces | Progressive training seed |
+| Low | 87.5% faces | Intermediate training step |
+| Medium Base | 75% faces | Primary ML input/training scale |
+| High (Original) | 0% (100%) | Ground truth / training target |
+| ML Enhanced | 0% (100%) | Network output with learned vertices |
 
 ## Data Format
 
-**Input**: OBJ mesh file (tested with `tennis_ball.obj`)
-- Must contain valid vertices and faces
-- Recommended: 1000+ faces for good results
-- Larger meshes work better (more training data)
+**Input**: OBJ mesh file (any format supported by trimesh)
+- Tested with: tennis_ball.obj and other parametric meshes
+- Minimum recommended: 300 faces for feasible simplification
+- Larger meshes (1000+) yield better training results
 
-**Output**: Trimesh scene with visual comparison
-- Red/Orange/Yellow: Traditional LOD levels
-- Green: ML-enhanced mesh (reconstructed)
-- Blue: Original high-poly target
+**Output**: Multi-mesh visualization scene
+- Ultra Low: Red (95% reduction)
+- Low: Orange (87.5% reduction)
+- Medium Base: Yellow (75% reduction, ML input)
+- ML Enhanced: Cyan (network output)
+- Original: Blue (ground truth)
+
+Before training: Shows LOD hierarchy
+After training: Shows before/after refinement comparison
 
 ## Key Design Decisions
+
+1. **Multi-Scale Progressive Refinement**: Cascading training from coarse to fine improves convergence and stability
+2. **Curvature-Adaptive Weighting**: High-curvature features get penalized less (50% weight) to preserve geometric details
+3. **Learnable Scaling**: Both feature and displacement scales are trainable parameters for automatic adaptation
+4. **Laplacian Regularization**: Prevents over-fitting on smooth surfaces while allowing feature detail recovery
+5. **Gradient Clipping**: Ensures stable training across all mesh complexities
+6. **Research GUI**: Interactive epoch configuration and real-time progress feedback for experimentation
 
 - **Interpolation Strategy**: k-NN with Gaussian weighting (k=8) provides smooth feature transfer
 - **Reduction Ratio**: 30% reduction (keeping 70% of faces) balances training speed vs. quality
@@ -125,7 +172,7 @@ Optional for GUI:
 
 ## Integration with Unity
 
-The GhostObjects project includes both Unity development and ML mesh enhancement:
+The BallReconstructor project includes both Unity development and ML mesh enhancement:
 - Unity project files are in the root directory
 - ML scripts are in the same directory as `tennis_ball.obj`
 - Enhanced meshes can be exported and imported into Unity scenes
@@ -135,7 +182,7 @@ The GhostObjects project includes both Unity development and ML mesh enhancement
 1. **Fixed Topology**: Model requires same face connectivity for input/output
 2. **Single Mesh Training**: Model trains on one mesh at a time (not generalized)
 3. **Memory Usage**: Large meshes (>50k vertices) may require GPU
-4. **Default Path**: Default mesh path is `C:\Users\Ber\GhostObjects\tennis_ball.obj`
+4. **Default Path**: Default mesh path is `C:\Users\Ber\BallReconstructor\tennis_ball.obj`
 5. **No Model Saving**: Model is retrained each run (no checkpoint persistence)
 
 ## Performance Metrics
