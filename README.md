@@ -1,6 +1,6 @@
 # BallReconstructor - Neural Mesh Super-Resolution
 
-A deep learning system that enhances low-poly 3D meshes to high-poly quality using a custom TensorFlow neural network. BallReconstructor uses multi-scale progressive refinement to learn geometric details from simplified meshes and reconstruct high-resolution vertices with impressive accuracy.
+A deep learning system that enhances low-poly 3D meshes to high-poly quality using a custom TensorFlow neural network. BallReconstructor uses multi-scale progressive refinement to learn geometric details from simplified meshes and reconstruct high-resolution vertices.
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![TensorFlow](https://img.shields.io/badge/TensorFlow-2.13+-orange.svg)
