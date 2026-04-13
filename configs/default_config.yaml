@@ -1,0 +1,72 @@
+# BallReconstructor Research - Default Configuration
+# Progressive Multi-Scale Mesh Refinement
+
+experiment:
+  name: "progressive_multiscale_baseline"
+  description: "Progressive multi-scale training with curvature weighting"
+  method: "progressive"
+  timestamp: true  # Auto-timestamp results
+
+dataset:
+  mesh_file: "tennis_ball.obj"
+  normalize: true
+  center: true
+
+mesh_lod:
+  # Quadric decimation ratios
+  ultra_low_ratio: 0.05      # 5% of faces
+  low_ratio: 0.125           # 12.5% of faces
+  medium_ratio: 0.25         # 25% of faces
+  # High is 100% (original)
+
+model:
+  architecture: "progressive"
+  hidden_dim: 512
+  dropout_rate: 0.1
+  
+  # Learnable scale parameters
+  feature_scale_init: 1.0
+  displacement_scale_init: 0.05
+
+training:
+  epochs: 150  # Increased for better convergence
+  batch_size: 1
+  learning_rate: 0.001
+  lr_decay_rate: 0.95
+  lr_decay_steps: 100
+  gradient_clip: 1.0
+  # Accuracy improvements:
+  reference_constraint_weight: 0.1  # Keep predictions close to high-res mesh
+  displacement_threshold: 0.9  # Clamp excessive displacements (90th percentile)
+  
+  # Scale-specific training
+  scales:
+    - name: "ultra_low_to_low"
+      weight: 1.0
+      k_nn: 8
+      
+    - name: "low_to_medium"
+      weight: 1.0
+      k_nn: 8
+      
+    - name: "medium_to_high"
+      weight: 2.0
+      k_nn: 16
+      enable_laplacian: true
+      laplacian_weight: 0.01
+      enable_curvature_weighting: true
+      curvature_threshold: 0.4
+
+optimization:
+  optimizer: "adam"
+  use_curvature_adaptive_weights: true
+  use_laplacian_regularization: true
+  use_template_noise: true
+  template_noise_std: 0.02
+
+output:
+  save_model: true
+  save_weights: true
+  save_metrics: true
+  visualize_results: true
+  export_enhanced_mesh: true
