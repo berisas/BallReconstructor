@@ -12,11 +12,14 @@ A deep learning system that enhances low-poly 3D meshes to high-poly quality usi
 - **Curvature-Adaptive Loss Weighting**: Intelligent weighting of feature-rich vs smooth regions during training
 - **Learnable Scaling Parameters**: Automatic adaptation of feature and displacement scales (trainable parameters)
 - **Research GUI Interface**: Interactive training interface with configurable epochs and real-time progress feedback
-- **Advanced LOD System**: Automatic multi-level mesh hierarchy generation (5 levels)
+- **Advanced LOD System**: Automatic multi-level mesh hierarchy generation (4 levels)
 - **Laplacian Regularization**: Prevents over-fitting on smooth surfaces while preserving geometric detail
 - **Comprehensive Metrics**: Detailed reconstruction error analysis and training statistics
 - **Gradient Clipping**: Stable training across mesh complexity variations (L2 norm ≤ 1.0)
-- **Flexible Input**: Works with any OBJ format mesh
+- **Flexible Input**: Works with OBJ, PLY, STL formats and multi-part mesh scenes
+- **Experiment Tracking**: Complete experiment logging with config, metrics, and checkpoints
+- **Configuration Management**: YAML-based hyperparameter configuration
+- **Reproducible Research**: Timestamped experiments with full metadata storage
 
 ## Installation
 
@@ -48,23 +51,66 @@ The GUI provides:
   - "View ML Enhanced Mesh" - Inspect the network output after training
 - **Quality Metrics**: Mean/max reconstruction error and quality improvement
 
-### Console Mode
+### Console Mode (Headless)
 
-If tkinter is unavailable, the application runs in console mode automatically with 150 default epochs.
+```bash
+python BallReconstructor.py path/to/mesh.obj
+```
+
+Pass a mesh file path as first argument to run in console mode. Automatically uses 150 default epochs.
+
+### Command-Line Arguments
+
+```bash
+python BallReconstructor.py <mesh_file> [options]
+
+Options:
+  --experiment NAME    Track experiment with name (creates experiment logs)
+  --config PATH        Use custom configuration file (YAML format)
+  --no-gui            Force console mode even if GUI is available
+```
+
+**Examples:**
+
+```bash
+# Basic console mode
+python BallReconstructor.py tennis_ball.obj
+
+# With experiment tracking
+python BallReconstructor.py my_mesh.obj --experiment exp_v1
+
+# With custom config
+python BallReconstructor.py my_mesh.obj --config configs/custom_config.yaml
+
+# With experiment tracking and custom config
+python BallReconstructor.py my_mesh.obj --experiment exp_v2 --config configs/exp2.yaml
+
+# Force console mode
+python BallReconstructor.py my_mesh.obj --no-gui
+```
+
+**Supported Mesh Formats:** `.obj`, `.ply`, `.stl` (via trimesh)
 
 ### Programmatic Usage
 
 ```python
-from BallReconstructor import MLLODSystem
+from training import MLLODSystem
 
 # Load mesh
 lod_system = MLLODSystem("path/to/your/mesh.obj")
 
-# Train the model
+# Train with default settings
 lod_system.train_ml_model(epochs=300)
 
+# Train with experiment tracking
+lod_system.train_ml_model(
+    epochs=300, 
+    experiment_name="my_experiment",
+    config_path="configs/my_config.yaml"
+)
+
 # Visualize results
-lod_system.show_visual_results()
+lod_system.preview_mesh()
 ```
 
 ## Architecture
@@ -111,7 +157,7 @@ Output: High-resolution vertices (predicted displacement + template)
 - Hidden dimension: 512
 - Dropout rate: 0.1
 - Feature scale: Trainable (initialized to 1.0)
-- Displacement scale: Trainable (initialized to 0.05)
+- Displacement scale: Trainable (initialized to 0.03) - Conservative refinement
 
 ### Multi-Scale Progressive Training
 
@@ -142,17 +188,85 @@ The system trains through **3 cascading scales** with progressive refinement:
 
 ### LOD System
 
-Automatic mesh hierarchy with 5 levels:
+Automatic mesh hierarchy with 4 levels (plus ML-enhanced variant):
 
 | Level | Faces | Reduction | Color | Purpose |
 |-------|-------|-----------|-------|---------|
-| Ultra Low | 5% of original | 95% | Red | Training seed |
-| Low | 12.5% of original | 87.5% | Orange | Intermediate step |
-| Medium Base | 25% of original | 75% | Yellow | Primary ML input |
-| Original | 100% | 0% | Blue | Ground truth / target |
+| Ultra Low | ~5% of original | ~95% | Red | Training seed |
+| Low | ~12.5% of original | ~87.5% | Orange | Intermediate step |
+| Medium Base | ~25% of original | ~75% | Yellow | Primary ML input |
+| Original (High) | 100% | 0% | Blue | Ground truth / target |
 | ML Enhanced | 100% | 0% | Cyan | Network output |
 
 ## Training Details
+
+### Experiment Tracking & Reproducibility
+
+When using the `--experiment` flag, BallReconstructor automatically creates a complete experiment record:
+
+```bash
+python BallReconstructor.py my_mesh.obj --experiment my_exp_v1
+```
+
+This creates a timestamped directory in `logs/my_exp_v1_YYYYMMDD_HHMMSS/` containing:
+
+```
+logs/my_exp_v1_20260414_103045/
+├── config.yaml              # Full experiment configuration
+├── metrics.csv              # Per-epoch metrics (loss, LR, etc.)
+├── checkpoints/             # Model checkpoints
+├── results/                 # Final results and analysis
+└── visualizations/          # Generated visualizations
+```
+
+**Benefits:**
+- Reproducible research with exact config logging
+- Per-epoch metrics tracking in CSV format
+- Model checkpoint saving for resuming training
+- Organized experiment directory structure
+
+### Configuration Files
+
+Create custom configuration files (YAML format) to control all hyperparameters:
+
+```yaml
+# configs/custom_config.yaml
+experiment:
+  name: 'high_quality_refinement'
+  method: 'progressive_multiscale'
+
+dataset:
+  mesh_file: 'my_mesh.obj'
+
+training:
+  epochs: 500
+  batch_size: 1
+  learning_rate: 0.001
+  lr_decay_rate: 0.95
+  lr_decay_steps: 100
+  gradient_clip: 1.0
+
+model:
+  architecture: 'encoder_decoder'
+  hidden_dim: 512
+  dropout_rate: 0.1
+  feature_scale_init: 1.0
+  displacement_scale_init: 0.03
+```
+
+Use custom configs:
+
+```bash
+python BallReconstructor.py my_mesh.obj --config configs/custom_config.yaml
+```
+
+Or with experiment tracking:
+
+```bash
+python BallReconstructor.py my_mesh.obj \
+  --experiment exp_v2 \
+  --config configs/exp2.yaml
+```
 
 ### Optimizer Configuration
 - **Type**: Adam with exponential learning rate decay
@@ -207,16 +321,26 @@ After training, displays:
 
 ```
 BallReconstructor/
-├── BallReconstructor.py       # Main application (LOD system + ML pipeline + GUI)
+├── BallReconstructor.py       # Main entry point with CLI
+├── gui.py                     # Interactive training GUI
+├── training.py                # MLLODSystem and training pipeline
+├── model.py                   # MeshSuperResNet neural network
+├── mesh_utils.py              # Mesh processing utilities
 ├── README.md                  # This file
 ├── CLAUDE.md                  # Technical documentation for AI assistants
 ├── requirements.txt           # Python dependencies
 ├── LICENSE                    # MIT license
-├── tennis_ball.obj            # Sample mesh for testing
+├── configs/                   # Configuration files (YAML)
+│   └── default_config.yaml
+├── logs/                      # Experiment logs (created at runtime)
+├── research/                  # Research infrastructure
+│   ├── experiment_tracker.py  # Experiment tracking and logging
+│   ├── config_manager.py      # Configuration loading
+│   ├── benchmark_suite.py     # Benchmarking utilities
+│   └── evaluation/            # Evaluation metrics
 ├── Assets/                    # Unity project assets
 ├── ProjectSettings/           # Unity project settings
-├── Packages/                  # Unity packages
-└── .git/                      # Git repository
+└── Packages/                  # Python packages
 ```
 
 ## Requirements
@@ -227,14 +351,17 @@ TensorFlow 2.13+
 NumPy 1.24+
 Trimesh 4.0+
 SciPy 1.11+
-Matplotlib 3.7+ (for visualization)
-Tkinter (optional, for GUI mode - usually bundled with Python)
+Matplotlib 3.7+
+PyYAML 6.0+ (for configuration files)
+Tkinter (optional, for GUI - usually bundled with Python)
 ```
 
 Install all dependencies:
 ```bash
-pip install tensorflow numpy trimesh scipy matplotlib
+pip install -r requirements.txt
 ```
+
+**Input File Formats**: OBJ, PLY, STL (via trimesh), plus multi-part mesh scenes
 
 ## Known Limitations
 
@@ -254,7 +381,7 @@ On the tennis ball mesh with 150 epochs:
 
 ## Future Improvements
 
-- [ ] Model checkpoint saving/loading for checkpoint-based training
+- [ ] Model checkpoint saving/loading for resuming training
 - [ ] Multi-mesh training for generalized models across different objects
 - [ ] GPU acceleration verification and optimization
 - [ ] Texture and normal map enhancement support
@@ -262,33 +389,64 @@ On the tennis ball mesh with 150 epochs:
 - [ ] Real-time preview during training
 - [ ] Direct Unity integration via native plugin
 - [ ] Web interface for remote training
-- [ ] Automated hyperparameter tuning
+- [ ] Automated hyperparameter tuning via Bayesian optimization
+- [ ] Model export to ONNX format for cross-platform inference
+
+## Completed Improvements
+
+- [x] Experiment tracking with config, metrics, and checkpoints
+- [x] Configuration file support (YAML)
+- [x] Multiple mesh format support (.obj, .ply, .stl)
+- [x] Command-line interface
+- [x] Scene/multi-part mesh handling
 
 ## Troubleshooting
 
 **Issue**: "Invalid mesh file - no vertices found"
-- Ensure OBJ file is valid and properly formatted
-- Check that file path is correct
+- Ensure OBJ/PLY/STL file is valid and properly formatted
+- Check that file path is correct and readable
+
+**Issue**: Command-line arguments not working
+- Make sure to use correct syntax: `python BallReconstructor.py <mesh_file> [options]`
+- Use `python BallReconstructor.py --help` to see all available options
+
+**Issue**: Experiment tracking not creating logs
+- Ensure `research` module is available (check imports in training.py)
+- Verify write permissions in the working directory
+- Check that `--experiment` flag is provided with experiment name
+
+**Issue**: Config file not being loaded
+- Verify YAML file format (check for syntax errors)
+- Ensure file path is correct (absolute or relative to working directory)
+- Check that required keys are present in config
 
 **Issue**: Training loss not decreasing
 - Increase number of epochs (try 300-500)
 - Verify mesh has sufficient complexity (minimum 300 faces recommended)
 - Check that all model variables are trainable
+- Try reducing learning rate in config
 
 **Issue**: High reconstruction error
 - Train for more epochs
 - Verify mesh quality and topology consistency
-- Consider increasing hidden dimension
+- Consider increasing hidden dimension in config
+- Check mesh is properly normalized
 
 **Issue**: GUI not launching
 - Tkinter may not be installed
-- Application falls back to console mode automatically
+- Use `--no-gui` flag to force console mode
+- Application falls back to console mode automatically if tkinter unavailable
 - Install tkinter: `pip install tk`
 
 **Issue**: Out of memory
-- Use GPU instead of CPU
-- Try on smaller mesh (simplify with higher reduction ratio)
-- Reduce batch processing
+- Use GPU instead of CPU (set TensorFlow to use GPU)
+- Try on smaller mesh (simplify with higher reduction ratio in code)
+- Reduce batch size or mesh complexity
+
+**Issue**: Scene/multi-part mesh errors
+- Ensure all parts are valid geometries with vertices and faces
+- Check that mesh file is valid and readable
+- Try converting to single mesh using external tool
 
 ## Contributing
 
